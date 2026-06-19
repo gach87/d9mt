@@ -728,7 +728,7 @@ namespace dxvk {
                  && cp[i].b == identity;
     }
 
-    if (!isIdentity && !m_presentParams.Windowed)
+    if (!isIdentity)
       m_blitter->setGammaRamp(NumControlPoints, cp.data());
     else
       m_blitter->setGammaRamp(0, nullptr);
