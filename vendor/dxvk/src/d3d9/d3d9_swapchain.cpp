@@ -1147,6 +1147,8 @@ namespace dxvk {
     if (m_frameLatencyCap)
       maxFrameLatency = std::min(maxFrameLatency, m_frameLatencyCap);
 
+    // d9mt: Metal's proxy texture is independent of swapchain images;
+    // clamp to 2 for safety (BackBufferCount+1) pending multi-proxy impl.
     maxFrameLatency = std::min(maxFrameLatency, m_presentParams.BackBufferCount + 1);
     return maxFrameLatency;
   }

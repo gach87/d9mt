@@ -50,3 +50,21 @@ fragment float4 blit_ps(BlitOut in [[stage_in]],
   constexpr sampler s(filter::linear, address::clamp_to_edge);
   return src.sample(s, in.uv);
 }
+
+// Gamma-corrected present blit: applies a 256-entry LUT (ushort per channel).
+struct GammaCp { ushort r, g, b, a; };
+
+fragment float4 blit_ps_gamma(BlitOut in [[stage_in]],
+                              texture2d<float> src [[texture(0)]],
+                              constant GammaCp* ramp [[buffer(0)]]) {
+  constexpr sampler s(filter::linear, address::clamp_to_edge);
+  float4 color = src.sample(s, in.uv);
+  float3 idx = color.rgb * 255.0f;
+  int3 i0 = clamp(int3(idx), 0, 255);
+  int3 i1 = min(i0 + 1, 255);
+  float3 t = idx - float3(i0);
+  float3 v0 = float3(ramp[i0.x].r, ramp[i0.y].g, ramp[i0.z].b) / 65535.0f;
+  float3 v1 = float3(ramp[i1.x].r, ramp[i1.y].g, ramp[i1.z].b) / 65535.0f;
+  color.rgb = mix(v0, v1, t);
+  return color;
+}

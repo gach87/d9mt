@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
+#include <cstdlib>
+#include <algorithm>
 #include <deque>
 #include <string>
 #include <vector>
@@ -1376,9 +1378,28 @@ public:
     return D3D_OK;
   }
   void STDMETHODCALLTYPE SetGammaRamp(UINT iSwapChain, DWORD Flags,
-                                      const D3DGAMMARAMP *pRamp) override {}
+                                      const D3DGAMMARAMP *pRamp) override {
+    if (!pRamp) return;
+    m_gammaRamp = *pRamp;
+    // detect identity ramp
+    m_gammaSet = false;
+    for (int i = 0; i < 256; i++) {
+      WORD expected = (WORD)std::min(65535, i * 257);
+      if (std::abs((int)pRamp->red[i] - (int)expected) > 256 ||
+          std::abs((int)pRamp->green[i] - (int)expected) > 256 ||
+          std::abs((int)pRamp->blue[i] - (int)expected) > 256) {
+        m_gammaSet = true;
+        break;
+      }
+    }
+  }
   void STDMETHODCALLTYPE GetGammaRamp(UINT iSwapChain,
-                                      D3DGAMMARAMP *pRamp) override {}
+                                      D3DGAMMARAMP *pRamp) override {
+    if (!pRamp) return;
+    if (m_gammaSet) { *pRamp = m_gammaRamp; return; }
+    for (int i = 0; i < 256; i++)
+      pRamp->red[i] = pRamp->green[i] = pRamp->blue[i] = (WORD)std::min(65535, i * 257);
+  }
 
   HRESULT STDMETHODCALLTYPE CreateTexture(
       UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format,
@@ -2372,6 +2393,13 @@ private:
   std::vector<std::pair<uint32_t, obj_handle_t>> m_blitPsoCache;
   obj_handle_t GetBlitPso(uint32_t dstFmt);
 
+  // gamma ramp: SetGammaRamp stores the LUT, Present applies it via blit_ps_gamma
+  D3DGAMMARAMP m_gammaRamp = {};
+  bool m_gammaSet = false;
+  obj_handle_t m_blitPsGamma = 0;
+  obj_handle_t m_gammaPso = 0;
+  obj_handle_t GetGammaPso(uint32_t dstFmt);
+
   std::vector<D9MTTexture *> m_pendingMipGen;
   void QueueMipGen(D9MTTexture *tex) {
     for (D9MTTexture *t : m_pendingMipGen)
@@ -3049,6 +3077,36 @@ obj_handle_t D9MTDevice::GetBlitPso(uint32_t dstFmt) {
   }
   m_blitPsoCache.push_back({dstFmt, pso});
   return pso;
+}
+
+obj_handle_t D9MTDevice::GetGammaPso(uint32_t dstFmt) {
+  if (m_gammaPso) return m_gammaPso;
+  if (!m_blitVs)
+    m_blitVs = MTLLibrary_newFunction(m_library, "blit_vs");
+  if (!m_blitPsGamma)
+    m_blitPsGamma = MTLLibrary_newFunction(m_library, "blit_ps_gamma");
+  if (!m_blitVs || !m_blitPsGamma) {
+    log_msg("GetGammaPso: gamma functions missing from metallib");
+    return 0;
+  }
+  WMTRenderPipelineInfo info = {};
+  info.colors[0].pixel_format = (WMTPixelFormat)dstFmt;
+  info.colors[0].write_mask = WMTColorWriteMaskAll;
+  info.rasterization_enabled = true;
+  info.raster_sample_count = 1;
+  info.depth_pixel_format = WMTPixelFormatInvalid;
+  info.stencil_pixel_format = WMTPixelFormatInvalid;
+  info.vertex_function = m_blitVs;
+  info.fragment_function = m_blitPsGamma;
+  info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+  info.max_tessellation_factor = 16;
+  obj_handle_t err = 0;
+  m_gammaPso = MTLDevice_newRenderPipelineState(m_mtlDevice, &info, &err);
+  if (!m_gammaPso) {
+    log_nserror("GetGammaPso", err);
+    return 0;
+  }
+  return m_gammaPso;
 }
 
 bool D9MTDevice::CreateBackbufferProxy() {
@@ -3779,7 +3837,58 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
   }
 
   // proxy -> drawable
-  {
+  if (m_gammaSet) {
+    // gamma-corrected present: render pass with LUT shader
+    obj_handle_t pso = GetGammaPso(WMTPixelFormatBGRA8Unorm);
+    if (pso) {
+      WMTRenderPassInfo pass = {};
+      pass.colors[0].texture = drawTex;
+      pass.colors[0].load_action = WMTLoadActionDontCare;
+      pass.colors[0].store_action = WMTStoreActionStore;
+      obj_handle_t enc = MTLCommandBuffer_renderCommandEncoder(cmdbuf, &pass);
+      if (enc) {
+        // pack gamma ramp into GammaCp (ushort r,g,b,a)
+        struct GammaCp { uint16_t r, g, b, a; };
+        GammaCp lut[256];
+        for (int i = 0; i < 256; i++) {
+          lut[i].r = m_gammaRamp.red[i];
+          lut[i].g = m_gammaRamp.green[i];
+          lut[i].b = m_gammaRamp.blue[i];
+          lut[i].a = 65535;
+        }
+        struct wmtcmd_render_setpso sp = {};
+        struct wmtcmd_render_useresource use = {};
+        struct wmtcmd_render_settexture st = {};
+        struct wmtcmd_render_setbytes sb = {};
+        struct wmtcmd_render_draw draw = {};
+        sp.type = WMTRenderCommandSetPSO;
+        sp.next.set(&use);
+        sp.pso = pso;
+        use.type = WMTRenderCommandUseResource;
+        use.next.set(&st);
+        use.resource = m_bbTex;
+        use.usage = WMTResourceUsageRead;
+        use.stages = (WMTRenderStages)(WMTRenderStageFragment);
+        st.type = WMTRenderCommandSetFragmentTexture;
+        st.next.set(&sb);
+        st.texture = m_bbTex;
+        st.index = 0;
+        sb.type = WMTRenderCommandSetFragmentBytes;
+        sb.next.set(&draw);
+        sb.bytes.set(lut);
+        sb.length = sizeof(lut);
+        sb.index = 0;
+        draw.type = WMTRenderCommandDraw;
+        draw.primitive_type = WMTPrimitiveTypeTriangle;
+        draw.vertex_start = 0;
+        draw.vertex_count = 3;
+        draw.instance_count = 1;
+        draw.base_instance = 0;
+        MTLRenderCommandEncoder_encodeCommands(enc, (const wmtcmd_base *)&sp);
+        MTLCommandEncoder_endEncoding(enc);
+      }
+    }
+  } else {
     struct wmtcmd_blit_copy_from_texture_to_texture cp = {};
     cp.type = WMTBlitCommandCopyFromTextureToTexture;
     cp.src = m_bbTex;
